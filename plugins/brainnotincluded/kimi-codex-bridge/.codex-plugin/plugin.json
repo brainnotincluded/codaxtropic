@@ -1,0 +1,42 @@
+{
+  "name": "kimi-codex-bridge",
+  "version": "0.1.0",
+  "description": "Codex MCP tools for starting Kimi Web and managing Kimi Code CLI sessions.",
+  "author": {
+    "name": "brainnotincluded",
+    "url": "https://github.com/brainnotincluded"
+  },
+  "homepage": "https://github.com/brainnotincluded/codaxtropic",
+  "repository": "https://github.com/brainnotincluded/codaxtropic",
+  "license": "MIT",
+  "keywords": [
+    "kimi",
+    "kimi-cli",
+    "kimi-code",
+    "mcp",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Kimi Codex Bridge",
+    "shortDescription": "Control Kimi Code CLI sessions from Codex.",
+    "longDescription": "Starts a local Kimi Web backend and exposes MCP tools for creating, listing, talking to, steering, canceling, updating, forking, and deleting Kimi Code CLI sessions.",
+    "developerName": "brainnotincluded",
+    "category": "Development & Workflow",
+    "capabilities": [
+      "MCP Tools",
+      "Session Management",
+      "Interactive"
+    ],
+    "websiteURL": "https://github.com/brainnotincluded/codaxtropic",
+    "privacyPolicyURL": "https://github.com/brainnotincluded/codaxtropic#privacy",
+    "termsOfServiceURL": "https://github.com/brainnotincluded/codaxtropic#terms",
+    "defaultPrompt": [
+      "Start Kimi Web and show status",
+      "Create a Kimi session for this repo",
+      "Ask Kimi to review the current project"
+    ],
+    "brandColor": "#111827"
+  }
+}

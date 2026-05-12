@@ -1,0 +1,19 @@
+{
+  "name": "kimi-codex-bridge",
+  "version": "0.1.0",
+  "description": "Codex MCP tools for Kimi Code CLI Web sessions.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "mcp:server": "node scripts/mcp-server.mjs",
+    "check": "node --check scripts/mcp-server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
