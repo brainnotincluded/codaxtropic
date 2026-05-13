@@ -24,6 +24,8 @@ kimi login
 
 The `kimi-code` executable is also supported. Set `KIMI_BRIDGE_COMMAND=kimi-code` if that is the command on your machine.
 
+No `npm install` step is required. The MCP bridge uses only Node.js built-ins.
+
 ## Install In Codex
 
 Add this repo as a plugin marketplace in Codex:

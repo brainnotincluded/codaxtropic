@@ -1,18 +1,15 @@
 #!/usr/bin/env node
-import { createWriteStream } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(__filename), "..");
 
@@ -21,6 +18,7 @@ const state = {
   preferredPort: Number.parseInt(process.env.KIMI_BRIDGE_PORT || "5494", 10),
   port: undefined,
   token: process.env.KIMI_BRIDGE_TOKEN || randomBytes(24).toString("hex"),
+  command: undefined,
   child: undefined,
   owned: false,
   lastStartError: undefined,
@@ -59,6 +57,51 @@ function errorResult(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function executableExists(candidate) {
+  try {
+    await access(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveKimiCommand() {
+  if (state.command) return state.command;
+
+  const configured = process.env.KIMI_BRIDGE_COMMAND || "kimi";
+  if (configured.includes("/") || configured.includes("\\")) {
+    if (!(await executableExists(configured))) {
+      throw new Error(`Kimi command is not executable: ${configured}`);
+    }
+    state.command = configured;
+    return configured;
+  }
+
+  const pathEntries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const home = os.homedir();
+  const extraEntries = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".cargo", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ];
+
+  for (const dir of [...pathEntries, ...extraEntries]) {
+    const candidate = path.join(dir, configured);
+    if (await executableExists(candidate)) {
+      state.command = candidate;
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `Cannot find '${configured}'. Install Kimi Code CLI or set KIMI_BRIDGE_COMMAND to its absolute path.`,
+  );
 }
 
 async function canListen(port) {
@@ -166,7 +209,7 @@ async function ensureBackend({ forceStart = false } = {}) {
     );
   }
 
-  const command = process.env.KIMI_BRIDGE_COMMAND || "kimi";
+  const command = await resolveKimiCommand();
   const port = await findFreePort(state.preferredPort);
   const logDir = process.env.KIMI_BRIDGE_LOG_DIR || path.join(os.tmpdir(), "kimi-codex-bridge");
   const stdoutPath = path.join(logDir, `kimi-web-${port}.stdout.log`);
@@ -202,6 +245,12 @@ async function ensureBackend({ forceStart = false } = {}) {
   state.port = port;
   state.lastStartError = undefined;
 
+  let spawnError;
+  child.once("error", (error) => {
+    spawnError = error;
+    state.lastStartError = error.message;
+  });
+
   child.stdout.pipe(createWriteStream(stdoutPath, { flags: "a" }));
   child.stderr.pipe(createWriteStream(stderrPath, { flags: "a" }));
   child.once("exit", (code, signal) => {
@@ -215,6 +264,9 @@ async function ensureBackend({ forceStart = false } = {}) {
   const timeoutMs = Number.parseInt(process.env.KIMI_BRIDGE_START_TIMEOUT_MS || "30000", 10);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (spawnError) {
+      throw new Error(`Failed to start Kimi Web: ${spawnError.message}`);
+    }
     if (child.exitCode !== null) {
       throw new Error(
         `Kimi Web exited during startup with code ${child.exitCode}. See ${stderrPath}.`,
@@ -251,6 +303,7 @@ function statusSnapshot() {
     host: state.host,
     port: state.port,
     preferred_port: state.preferredPort,
+    command: state.command ?? null,
     owned_process: state.owned,
     process_pid: state.child?.pid ?? null,
     token_configured: Boolean(state.token),
@@ -262,7 +315,7 @@ function statusSnapshot() {
 }
 
 async function getKimiVersion() {
-  const command = process.env.KIMI_BRIDGE_COMMAND || "kimi";
+  const command = await resolveKimiCommand();
   return new Promise((resolve) => {
     const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
@@ -631,19 +684,147 @@ async function readSessionEvents(sessionId, limit = 100) {
     });
 }
 
-const server = new McpServer({
-  name: "kimi-codex-bridge",
-  version: VERSION,
-});
+const JSON_SCHEMA = "http://json-schema.org/draft-07/schema#";
+const schema = {
+  empty: { type: "object", properties: {}, additionalProperties: false, $schema: JSON_SCHEMA },
+  status: {
+    type: "object",
+    properties: {
+      start: { type: "boolean", description: "Start Kimi Web if it is not reachable." },
+    },
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  listSessions: {
+    type: "object",
+    properties: {
+      limit: { type: "integer", minimum: 1, maximum: 500 },
+      offset: { type: "integer", minimum: 0 },
+      q: { type: "string" },
+      archived: { type: "boolean" },
+    },
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  createSession: {
+    type: "object",
+    properties: {
+      work_dir: { type: "string" },
+      create_dir: { type: "boolean" },
+    },
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  sessionId: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  prompt: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", minLength: 1 },
+      session_id: { type: "string", format: "uuid" },
+      work_dir: { type: "string" },
+      create_session: { type: "boolean" },
+      timeout_ms: { type: "integer", minimum: 1000, maximum: 3600000 },
+      approval_response: { type: "string", enum: ["reject", "approve", "approve_for_session"] },
+      rejection_feedback: { type: "string" },
+      question_strategy: { type: "string", enum: ["empty", "first_option"] },
+      include_events: { type: "boolean" },
+    },
+    required: ["prompt"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  steer: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      message: { type: "string", minLength: 1 },
+      timeout_ms: { type: "integer", minimum: 1000, maximum: 300000 },
+    },
+    required: ["session_id", "message"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  cancel: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      timeout_ms: { type: "integer", minimum: 1000, maximum: 300000 },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  planMode: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      enabled: { type: "boolean" },
+      timeout_ms: { type: "integer", minimum: 1000, maximum: 300000 },
+    },
+    required: ["session_id", "enabled"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  updateSession: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      title: { type: "string", minLength: 1, maxLength: 200 },
+      archived: { type: "boolean" },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  forkSession: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      turn_index: { type: "integer", minimum: 0 },
+    },
+    required: ["session_id", "turn_index"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+  sessionEvents: {
+    type: "object",
+    properties: {
+      session_id: { type: "string", format: "uuid" },
+      limit: { type: "integer", minimum: 1, maximum: 1000 },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+    $schema: JSON_SCHEMA,
+  },
+};
 
-server.registerTool(
+const tools = new Map();
+
+function registerTool(name, config, handler) {
+  tools.set(name, {
+    name,
+    title: config.title,
+    description: config.description,
+    inputSchema: config.inputSchema || schema.empty,
+    execution: { taskSupport: "forbidden" },
+    handler,
+  });
+}
+
+registerTool(
   "kimi_status",
   {
     title: "Kimi Status",
     description: "Start or inspect the local Kimi Web backend used by this bridge.",
-    inputSchema: {
-      start: z.boolean().optional().describe("Start Kimi Web if it is not reachable."),
-    },
+    inputSchema: schema.status,
   },
   async ({ start = true }) => {
     try {
@@ -656,12 +837,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_start",
   {
     title: "Start Kimi Web",
     description: "Force-start a Kimi Web backend owned by this bridge.",
-    inputSchema: {},
+    inputSchema: schema.empty,
   },
   async () => {
     try {
@@ -673,12 +854,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_stop",
   {
     title: "Stop Kimi Web",
     description: "Stop the Kimi Web backend process if it was started by this bridge.",
-    inputSchema: {},
+    inputSchema: schema.empty,
   },
   async () => {
     try {
@@ -689,17 +870,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_list_sessions",
   {
     title: "List Kimi Sessions",
     description: "List Kimi Code CLI Web sessions.",
-    inputSchema: {
-      limit: z.number().int().min(1).max(500).optional(),
-      offset: z.number().int().min(0).optional(),
-      q: z.string().optional(),
-      archived: z.boolean().optional(),
-    },
+    inputSchema: schema.listSessions,
   },
   async ({ limit = 100, offset = 0, q, archived }) => {
     try {
@@ -716,15 +892,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_create_session",
   {
     title: "Create Kimi Session",
     description: "Create a Kimi Code CLI session for a working directory.",
-    inputSchema: {
-      work_dir: z.string().optional(),
-      create_dir: z.boolean().optional(),
-    },
+    inputSchema: schema.createSession,
   },
   async (args) => {
     try {
@@ -735,14 +908,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_get_session",
   {
     title: "Get Kimi Session",
     description: "Get Kimi session metadata.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-    },
+    inputSchema: schema.sessionId,
   },
   async ({ session_id }) => {
     try {
@@ -753,22 +924,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_prompt",
   {
     title: "Prompt Kimi",
     description: "Send a prompt to a Kimi session and wait for the turn to finish.",
-    inputSchema: {
-      prompt: z.string().min(1),
-      session_id: z.string().uuid().optional(),
-      work_dir: z.string().optional(),
-      create_session: z.boolean().optional(),
-      timeout_ms: z.number().int().min(1000).max(3600000).optional(),
-      approval_response: z.enum(["reject", "approve", "approve_for_session"]).optional(),
-      rejection_feedback: z.string().optional(),
-      question_strategy: z.enum(["empty", "first_option"]).optional(),
-      include_events: z.boolean().optional(),
-    },
+    inputSchema: schema.prompt,
   },
   async (args) => {
     try {
@@ -800,16 +961,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_steer",
   {
     title: "Steer Kimi",
     description: "Inject follow-up input into an active Kimi turn.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      message: z.string().min(1),
-      timeout_ms: z.number().int().min(1000).max(300000).optional(),
-    },
+    inputSchema: schema.steer,
   },
   async ({ session_id, message, timeout_ms = 30000 }) => {
     try {
@@ -827,15 +984,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_cancel",
   {
     title: "Cancel Kimi Turn",
     description: "Cancel an active Kimi turn.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      timeout_ms: z.number().int().min(1000).max(300000).optional(),
-    },
+    inputSchema: schema.cancel,
   },
   async ({ session_id, timeout_ms = 30000 }) => {
     try {
@@ -852,16 +1006,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_set_plan_mode",
   {
     title: "Set Kimi Plan Mode",
     description: "Enable or disable plan mode for a Kimi session.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      enabled: z.boolean(),
-      timeout_ms: z.number().int().min(1000).max(300000).optional(),
-    },
+    inputSchema: schema.planMode,
   },
   async ({ session_id, enabled, timeout_ms = 30000 }) => {
     try {
@@ -879,16 +1029,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_update_session",
   {
     title: "Update Kimi Session",
     description: "Rename, archive, or unarchive a Kimi session.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      title: z.string().min(1).max(200).optional(),
-      archived: z.boolean().optional(),
-    },
+    inputSchema: schema.updateSession,
   },
   async ({ session_id, title, archived }) => {
     try {
@@ -904,14 +1050,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_delete_session",
   {
     title: "Delete Kimi Session",
     description: "Delete a Kimi session.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-    },
+    inputSchema: schema.sessionId,
   },
   async ({ session_id }) => {
     try {
@@ -923,15 +1067,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_fork_session",
   {
     title: "Fork Kimi Session",
     description: "Fork a Kimi session at a zero-based turn index.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      turn_index: z.number().int().min(0),
-    },
+    inputSchema: schema.forkSession,
   },
   async ({ session_id, turn_index }) => {
     try {
@@ -947,15 +1088,12 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "kimi_session_events",
   {
     title: "Read Kimi Session Events",
     description: "Read recent raw Kimi Wire events from a session wire.jsonl file.",
-    inputSchema: {
-      session_id: z.string().uuid(),
-      limit: z.number().int().min(1).max(1000).optional(),
-    },
+    inputSchema: schema.sessionEvents,
   },
   async ({ session_id, limit = 100 }) => {
     try {
@@ -965,6 +1103,127 @@ server.registerTool(
     }
   },
 );
+
+function writeJson(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function sendResult(id, result) {
+  writeJson({ result, jsonrpc: "2.0", id });
+}
+
+function sendError(id, code, message, data = undefined) {
+  writeJson({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message,
+      ...(data === undefined ? {} : { data }),
+    },
+  });
+}
+
+function listToolDescriptors() {
+  return Array.from(tools.values()).map(({ handler: _handler, ...tool }) => tool);
+}
+
+async function handleRpcMessage(message) {
+  const id = message.id ?? null;
+  const method = message.method;
+
+  if (!method) {
+    if (id !== null) sendError(id, -32600, "Invalid request: missing method.");
+    return;
+  }
+
+  if (id === null && method.startsWith("notifications/")) return;
+
+  switch (method) {
+    case "initialize":
+      sendResult(id, {
+        protocolVersion: message.params?.protocolVersion || "2024-11-05",
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "kimi-codex-bridge", version: VERSION },
+      });
+      return;
+
+    case "ping":
+      sendResult(id, {});
+      return;
+
+    case "tools/list":
+      sendResult(id, { tools: listToolDescriptors() });
+      return;
+
+    case "tools/call": {
+      const name = message.params?.name;
+      if (typeof name !== "string") {
+        sendError(id, -32602, "Invalid params: tools/call requires a tool name.");
+        return;
+      }
+      const tool = tools.get(name);
+      if (!tool) {
+        sendError(id, -32602, `Unknown tool: ${name}`);
+        return;
+      }
+      const args = message.params?.arguments || {};
+      const result = await tool.handler(args);
+      sendResult(id, result);
+      return;
+    }
+
+    case "resources/list":
+      sendResult(id, { resources: [] });
+      return;
+
+    case "prompts/list":
+      sendResult(id, { prompts: [] });
+      return;
+
+    default:
+      sendError(id, -32601, `Method not found: ${method}`);
+  }
+}
+
+async function serveStdio() {
+  const pending = new Set();
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+  let closedResolve;
+  const closed = new Promise((resolve) => {
+    closedResolve = resolve;
+  });
+
+  rl.on("line", (line) => {
+    if (!line.trim()) return;
+    const task = (async () => {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        sendError(null, -32700, "Parse error", String(error));
+        return;
+      }
+
+      try {
+        await handleRpcMessage(message);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        sendError(message.id ?? null, -32603, msg);
+      }
+    })();
+
+    pending.add(task);
+    task.finally(() => pending.delete(task));
+  });
+
+  rl.once("close", () => closedResolve());
+  await closed;
+  while (pending.size > 0) {
+    await Promise.allSettled(Array.from(pending));
+  }
+}
 
 async function main() {
   if (process.env.KIMI_BRIDGE_AUTOSTART !== "0") {
@@ -977,7 +1236,8 @@ async function main() {
     }
   }
 
-  await server.connect(new StdioServerTransport());
+  await serveStdio();
+  await stopBackend();
 }
 
 process.once("SIGINT", async () => {
@@ -987,14 +1247,6 @@ process.once("SIGINT", async () => {
 process.once("SIGTERM", async () => {
   await stopBackend();
   process.exit(143);
-});
-process.stdin.once("end", async () => {
-  await stopBackend();
-  process.exit(0);
-});
-process.stdin.once("close", async () => {
-  await stopBackend();
-  process.exit(0);
 });
 process.once("exit", () => {
   if (state.child) state.child.kill("SIGTERM");
